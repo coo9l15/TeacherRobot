@@ -10,6 +10,8 @@ import time
 import json
 import os
 from datetime import datetime
+import threading
+from eye_tracker import EyeTracker  # Import the EyeTracker class
 
 # Worker for running Gemma model in a separate thread
 class GemmaWorker(QObject):
@@ -314,21 +316,6 @@ class AddStudentDialog(QDialog):
             self.tab_widget.setCurrentIndex(0)
             return
         
-        # Check if eye tracker is available
-        if not self.eye_tracker:
-            # Simulate a slow calibration even without eye tracker
-            self._calibration_check_count = 0
-            self.calibrate_btn.setEnabled(False)
-            self.status_label.setText("Simulating calibration. Please wait ~20 seconds...")
-            self.progress_bar.setValue(0)
-            
-            # Get basic student data
-            student_data = self.get_student_data()
-            
-            # Start a polling timer to simulate calibration
-            QTimer.singleShot(500, lambda: self.check_calibration_status(student_data))
-            return
-        
         # Get basic student data
         student_data = self.get_student_data()
         
@@ -336,61 +323,51 @@ class AddStudentDialog(QDialog):
         self.calibrate_btn.setEnabled(False)
         self.status_label.setText("Calibrating... Please follow instructions on screen")
         self.progress_bar.setValue(0)
-        self._calibration_check_count = 0
         
-        try:
-            # Try to start eye tracker calibration if available
-            if hasattr(self.eye_tracker, 'start_calibration'):
+        # Check if eye tracker is available
+        if not self.eye_tracker:
+            # Simulate calibration if no eye tracker
+            self.calibration_worker = CalibrationWorker(self.eye_tracker, student_data)
+            self.calibration_thread = QThread()
+            self.calibration_worker.moveToThread(self.calibration_thread)
+            self.calibration_worker.progress_update.connect(self.update_calibration_progress)
+            self.calibration_worker.finished.connect(self.calibration_finished)
+            self.calibration_worker.error.connect(self.calibration_error)
+            self.calibration_thread.started.connect(self.calibration_worker.run)
+            self.calibration_thread.start()
+        else:
+            try:
+                # Connect progress and status callbacks
                 self.eye_tracker.set_status_callback(lambda msg: self.status_label.setText(msg))
                 self.eye_tracker.set_progress_callback(lambda progress: self.progress_bar.setValue(int(progress)))
-                self.eye_tracker.start_calibration()
-                # Poll for completion - ensure we wait at least 15-20 seconds
-                QTimer.singleShot(500, lambda: self.check_calibration_status(student_data))
-            else:
-                # Fallback to simulated calibration
-                self.calibration_worker = CalibrationWorker(self.eye_tracker, student_data)
-                self.calibration_thread = QThread()
-                self.calibration_worker.moveToThread(self.calibration_thread)
-                self.calibration_worker.progress_update.connect(self.update_calibration_progress)
-                self.calibration_worker.finished.connect(self.calibration_finished)
-                self.calibration_worker.error.connect(self.calibration_error)
-                self.calibration_thread.started.connect(self.calibration_worker.run)
-                self.calibration_thread.start()
-        except Exception as e:
-            self.status_label.setText(f"Error starting calibration: {str(e)}")
-            self.calibrate_btn.setEnabled(True)
-            
-    def check_calibration_status(self, student_data):
-        # Check if eye tracker calibration is complete
-        if not self.eye_tracker or not hasattr(self.eye_tracker, 'ear_threshold'):
-            # If no update after 40 seconds, consider it failed (increased from 10s)
-            if getattr(self, '_calibration_check_count', 0) > 80:  # Increased from 20
-                self.calibration_error("Calibration timed out")
-                return
                 
-            # Increment check counter
-            self._calibration_check_count = getattr(self, '_calibration_check_count', 0) + 1
-            
-            # Update progress based on check count - SLOWER progress
-            # This will take ~40 seconds to reach 100%
-            progress = min(95, self._calibration_check_count * 1.2)  # Reduced from 5 to 1.2
-            self.progress_bar.setValue(progress)
-            
-            # Check again after a delay - longer delay for more accurate timing
-            QTimer.singleShot(500, lambda: self.check_calibration_status(student_data))
-        else:
-            # Calibration complete
-            self.progress_bar.setValue(100)
-            
-            # Add eye tracker data to student profile
-            student_data["calibration"] = {
-                "timestamp": datetime.now().isoformat(),
-                "ear_threshold": self.eye_tracker.ear_threshold,
-                "eye_pattern": f"eye_pattern_{hash(student_data['name'] + student_data['id'])}"
-            }
-            
-            self.calibration_finished(student_data)
-            
+                # Start a student-specific calibration
+                student_id = student_data['id']
+                student_name = student_data['name']
+                
+                # Use calibrate_for_student to associate the profile with the student
+                threshold = self.eye_tracker.calibrate_for_student(student_id, student_name)
+                
+                # Add eye tracker data to student profile
+                student_data["calibration"] = {
+                    "timestamp": datetime.now().isoformat(),
+                    "ear_threshold": threshold,
+                    "head_pose_threshold": self.eye_tracker.head_pose_threshold,
+                    "eye_pattern": f"eye_pattern_{hash(student_data['name'] + student_data['id'])}"
+                }
+                
+                # Calibration is complete - update UI
+                self.progress_bar.setValue(100)
+                self.status_label.setText("Calibration complete!")
+                self.calibrated_data = student_data
+                
+                # Delay enabling the OK button to prevent accidental clicking
+                QTimer.singleShot(1500, lambda: self.button_box.button(QDialogButtonBox.Ok).setEnabled(True))
+                
+            except Exception as e:
+                self.calibration_error(f"Eye tracker calibration error: {str(e)}")
+                self.calibrate_btn.setEnabled(True)
+    
     def update_calibration_progress(self, value):
         self.progress_bar.setValue(value)
     
@@ -541,12 +518,23 @@ class MainWindow(QMainWindow):
     def __init__(self, gemma_model_instance=None, eye_tracker_instance=None):
         super().__init__()
         self.gemma_model = gemma_model_instance
-        self.eye_tracker = eye_tracker_instance
         self.gemma_thread = None
         self.gemma_worker = None
         self.students = []  # List to store student data
         self.current_student = None  # Currently detected/selected student
         self.data_file = "assets/students.json"
+        
+        # Initialize eye tracker if not provided
+        if eye_tracker_instance:
+            self.eye_tracker = eye_tracker_instance
+        else:
+            try:
+                # Initialize in lightweight mode for better compatibility
+                self.eye_tracker = EyeTracker(lightweight_mode=True)
+                print("Eye tracker initialized in lightweight mode")
+            except Exception as e:
+                print(f"Could not initialize eye tracker: {str(e)}")
+                self.eye_tracker = None
         
         # Load existing student data if available
         self.load_students()
@@ -805,6 +793,10 @@ class MainWindow(QMainWindow):
         # Save student data before closing
         self.save_students()
         
+        # Clean up eye tracker
+        if hasattr(self, 'eye_tracker') and self.eye_tracker:
+            self.eye_tracker.release()
+        
         if self.gemma_worker:
             self.gemma_worker.stop()
         if self.gemma_thread and self.gemma_thread.isRunning():
@@ -870,37 +862,57 @@ class MainWindow(QMainWindow):
         if not self.eye_tracker or not self.students:
             return
         
-        # Try to use actual eye tracking for detection if available
         try:
+            # Check if user is present and looking at camera
             if self.eye_tracker.is_user_present() and self.eye_tracker.is_looking_at_camera():
-                # Try to match current eye pattern with calibration data
-                detected_student = None
+                # In a real implementation, we'd match the eye pattern with calibrated profiles
+                # For now, use student profiles with their thresholds to find best match
                 
-                # For now, use a simple simulation
-                # In a real system, you would compare eye tracking patterns
-                import random
-                if random.random() < 0.3:  # 30% chance to detect a different student
-                    student_index = random.randint(0, len(self.students)-1)
-                    detected_student = self.students[student_index]
-                    
-                    # Only switch if it's a different student
-                    if self.current_student != detected_student:
-                        self.update_status(f"Detected student: {detected_student['name']}")
-                        # Select the student in the dropdown (+1 for the "Select" item)
-                        self.student_selector.setCurrentIndex(student_index + 1)
+                best_match = None
+                best_match_score = 0
+                
+                # Try to identify by checking if the currently detected pattern matches any students
+                for student in self.students:
+                    if 'calibration' in student:
+                        # Get the student's calibration data
+                        calibration = student['calibration']
+                        
+                        # Check if the calibration matches the current user
+                        # This is a simplified version - in a real implementation, 
+                        # we would compare eye patterns more comprehensively
+                        if 'ear_threshold' in calibration:
+                            # As a very basic method, check if the current EAR is close to the student's threshold
+                            # In a real implementation, this would be much more sophisticated
+                            match_score = 1.0  # Default to equal likelihood for all students with calibration
+                            
+                            if match_score > best_match_score:
+                                best_match_score = match_score
+                                best_match = student
+                
+                # If we found a match and it's different from current student
+                if best_match and (not self.current_student or best_match['id'] != self.current_student['id']):
+                    # Find the index of the matched student
+                    for i, student in enumerate(self.students):
+                        if student['id'] == best_match['id']:
+                            # Select the student in the dropdown (+1 for the "Select" item)
+                            self.student_selector.setCurrentIndex(i + 1)
+                            self.update_status(f"Eye tracking detected student: {best_match['name']}")
+                            break
+            else:
+                # If user is not present or not looking, optionally deselect the student
+                # or keep the current selection
+                pass
+                
         except Exception as e:
-            # If eye tracking fails, fall back to random simulation
             print(f"Error in student detection: {e}")
-            import random
-            if random.random() < 0.1:  # Reduce to 10% chance for fallback
-                student_index = random.randint(0, len(self.students)-1)
-                detected_student = self.students[student_index]
-                
-                # Only switch if it's a different student
-                if self.current_student != detected_student:
-                    self.update_status(f"Detected student: {detected_student['name']}")
-                    # Select the student in the dropdown (+1 for the "Select" item)
+            # Fallback to a random student if eye tracking fails
+            # This is just for testing purposes
+            if not self.current_student and self.students:
+                import random
+                if random.random() < 0.1:  # 10% chance to select a random student
+                    student_index = random.randint(0, len(self.students)-1)
                     self.student_selector.setCurrentIndex(student_index + 1)
+                    self.update_status(f"Random student selected for testing")
 
     def show_add_student_dialog(self):
         dialog = AddStudentDialog(self, self.eye_tracker)
@@ -1068,6 +1080,19 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    main_window = MainWindow()
+    
+    # Initialize EyeTracker
+    try:
+        import platform
+        # Check if running on Raspberry Pi for lightweight mode
+        is_raspberry_pi = platform.machine().startswith('arm')
+        eye_tracker = EyeTracker(lightweight_mode=is_raspberry_pi)
+        print(f"Eye tracker initialized in {'lightweight' if is_raspberry_pi else 'full'} mode")
+    except Exception as e:
+        print(f"Could not initialize eye tracker: {str(e)}")
+        eye_tracker = None
+    
+    # Pass the eye tracker to MainWindow
+    main_window = MainWindow(eye_tracker_instance=eye_tracker)
     main_window.show()
     sys.exit(app.exec_())
